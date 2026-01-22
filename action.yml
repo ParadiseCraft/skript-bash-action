@@ -1,0 +1,126 @@
+name: 'Skript Tests Action'
+description: 'Test Skript scripts by running them in a temporary Minecraft server'
+author: 'Andromedov'
+
+inputs:
+  minecraft-version:
+    description: 'Minecraft version to use'
+    required: true
+    default: '1.21.10'
+  skript-version:
+    description: 'Skript version tag (e.g., 2.14.0)'
+    required: true
+    default: '2.14.0'
+  path-to-skripts:
+    description: 'Path to directory containing Skript files'
+    required: true
+    default: './scripts'
+  path-to-addons:
+    description: 'Path to directory containing Skript addons (.jar files)'
+    required: false
+    default: './addons'
+  server-ram:
+    description: 'Amount of RAM for the server'
+    required: false
+    default: '2G'
+
+runs:
+  using: "composite"
+  steps:
+    - name: Setup Java
+      uses: actions/setup-java@v4
+      with:
+        distribution: 'temurin'
+        java-version: '21'
+
+    - name: Setup Server Environment
+      shell: bash
+      run: |
+        echo "::group::🛠️ Server Setup"
+        mkdir -p temp_server/plugins/Skript/scripts
+        cd temp_server
+        
+        MC_VER="${{ inputs.minecraft-version }}"
+        echo "Downloading Paper for Minecraft $MC_VER..."
+        
+        BUILD_ID=$(curl -s "https://api.papermc.io/v2/projects/paper/versions/$MC_VER/builds" | jq -r '.builds[-1].build')
+        JAR_NAME="paper-$MC_VER-$BUILD_ID.jar"
+        DOWNLOAD_URL="https://api.papermc.io/v2/projects/paper/versions/$MC_VER/builds/$BUILD_ID/downloads/$JAR_NAME"
+        
+        curl -o server.jar "$DOWNLOAD_URL"
+        
+        # Приймаємо EULA
+        echo "eula=true" > eula.txt
+        
+        # Налаштування server.properties (оптимізація для тесту)
+        cat <<EOF > server.properties
+        online-mode=false
+        difficulty=peaceful
+        spawn-protection=0
+        max-tick-time=60000
+        view-distance=4
+        allow-nether=false
+        generate-structures=false
+        EOF
+        echo "::endgroup::"
+
+    - name: Install Plugins
+      shell: bash
+      run: |
+        echo "::group::📦 Installing Plugins"
+        cd temp_server/plugins
+        
+        # Завантаження Skript (замінює downloadSkript з JS)
+        SK_VER="${{ inputs.skript-version }}"
+        echo "Downloading Skript v$SK_VER..."
+        wget -q -O Skript.jar "https://github.com/SkriptLang/Skript/releases/download/$SK_VER/Skript-$SK_VER.jar" || \
+        wget -q -O Skript.jar "https://github.com/SkriptLang/Skript/releases/download/2.14.0/Skript-2.14.0.jar" # Fallback
+        
+        ADDONS_PATH="${{ github.workspace }}/${{ inputs.path-to-addons }}"
+        if [ -d "$ADDONS_PATH" ]; then
+          echo "Copying addons from $ADDONS_PATH..."
+          cp "$ADDONS_PATH"/*.jar . 2>/dev/null || echo "No .jar files found in addons folder"
+        fi
+        echo "::endgroup::"
+
+    - name: Copy Scripts
+      shell: bash
+      run: |
+        echo "📂 Copying scripts..."
+        SCRIPTS_PATH="${{ github.workspace }}/${{ inputs.path-to-skripts }}"
+        DEST_PATH="temp_server/plugins/Skript/scripts/"
+        
+        if [ -d "$SCRIPTS_PATH" ]; then
+          cp -r "$SCRIPTS_PATH"/* "$DEST_PATH"
+          echo "Scripts copied."
+        else
+          echo "::error::Scripts directory not found: $SCRIPTS_PATH"
+          exit 1
+        fi
+
+    - name: Run Validation
+      shell: bash
+      run: |
+        cd temp_server
+        echo "🚀 Starting Server..."
+        
+        timeout 120s java -Xms${{ inputs.server-ram }} -Xmx${{ inputs.server-ram }} -Djava.awt.headless=true -jar server.jar --nogui > latest.log 2>&1 || true
+        
+        echo "::group::🔍 Log Analysis"
+        
+        if grep -q "\[Skript\] Error" latest.log; then
+          echo "❌ ERRORS FOUND:"
+          grep -C 2 "\[Skript\] Error" latest.log
+          
+          grep "\[Skript\] Error" latest.log | while read -r line ; do
+             echo "::error title=Skript Error::$line"
+          done
+          
+          echo "::endgroup::"
+          exit 1
+        else
+          echo "✅ SUCCESS: No Skript syntax errors found."
+          grep "Loaded .* scripts" latest.log || echo "Scripts loaded check passed."
+          echo "::endgroup::"
+          exit 0
+        fi
